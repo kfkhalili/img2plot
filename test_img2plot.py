@@ -545,7 +545,7 @@ def test_load_image_raises_for_missing_file(tmp_path: Path):
 def test_write_svg_produces_one_line_element_per_line(tmp_path: Path):
     lines = [Line(0, 0, 10, 10, 11), Line(5, 5, 15, 5, 11), Line(7, 1, 7, 9, 9)]
     out = tmp_path / "out.svg"
-    write_svg(lines, out)
+    write_svg(lines, out, size=(20, 20))
     assert out.exists()
     tree = ET.parse(out)
     line_elts = tree.findall(".//svg:line", SVG_NS)
@@ -557,11 +557,68 @@ def test_write_svg_produces_one_line_element_per_line(tmp_path: Path):
 
 def test_write_svg_with_empty_list_still_writes_valid_file(tmp_path: Path):
     out = tmp_path / "empty.svg"
-    write_svg([], out)
+    write_svg([], out, size=(10, 10))
     assert out.exists()
     tree = ET.parse(out)  # must parse without raising
     line_elts = tree.findall(".//svg:line", SVG_NS)
     assert line_elts == []
+
+
+def test_write_svg_sets_viewbox_and_size_from_size_argument(tmp_path: Path):
+    """Without viewBox + concrete dims, the SVG renders empty in browsers
+    because the line coords land outside the default 300x150 viewport."""
+    out = tmp_path / "sized.svg"
+    write_svg([Line(0, 0, 100, 50, 2)], out, size=(200, 100))
+    tree = ET.parse(out)
+    root = tree.getroot()
+    assert root.attrib["viewBox"] == "0 0 200 100"
+    assert root.attrib["width"] == "200px"
+    assert root.attrib["height"] == "100px"
+
+
+def test_write_svg_factors_stroke_onto_parent_group(tmp_path: Path):
+    """Stroke attributes live on the parent <g>, not on every <line>, so
+    dense files stay compact."""
+    out = tmp_path / "grouped.svg"
+    write_svg([Line(0, 0, 1, 1, 2)], out, size=(10, 10))
+    tree = ET.parse(out)
+    g = tree.find(".//svg:g", SVG_NS)
+    assert g is not None
+    assert g.attrib.get("stroke") == "black"
+    assert g.attrib.get("stroke-linecap") == "round"
+    line = tree.find(".//svg:line", SVG_NS)
+    assert "stroke" not in line.attrib
+
+
+def test_main_svg_dimensions_match_input_image(tmp_path: Path):
+    """The emitted SVG canvas should exactly match the input image dimensions."""
+    png = tmp_path / "square.png"
+    svg = tmp_path / "out.svg"
+    _write_square_png(png, size=96, inset=24)
+    main(["-i", str(png), "-o", str(svg)])
+    tree = ET.parse(svg)
+    root = tree.getroot()
+    assert root.attrib["viewBox"] == "0 0 96 96"
+    assert root.attrib["width"] == "96px"
+    assert root.attrib["height"] == "96px"
+
+
+def test_grow_line_endpoints_stay_within_image_bounds():
+    """The inner walker can step past the image bound by 1-2 pixels before
+    the while-condition kicks in. Endpoints must be clamped so they don't
+    leak into the SVG and confuse downstream renderers/plotters."""
+    rng = np.random.default_rng(7)
+    img = np.zeros((32, 32))
+    img[:, 16:] = 1.0
+    img = img + rng.normal(0, 0.05, img.shape)
+    smooth = gaussian_filter(img, 1)
+    mag = edge_probability(smooth)
+    grady, gradx = np.gradient(smooth)
+    cfg = ExtractionConfig(min_line_length=1, max_curve_angle_deg=180.0)
+    # Seed somewhere likely to walk past a boundary.
+    line = grow_line(mag, gradx, grady, 16, 1, cfg)
+    for coord, hi in [(line.x1, 32), (line.x2, 32), (line.y1, 32), (line.y2, 32)]:
+        assert 0 <= coord < hi, line
 
 
 # --------------------------------------------------------------------------- #

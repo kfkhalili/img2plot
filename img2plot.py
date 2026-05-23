@@ -175,7 +175,12 @@ def grow_line(
     py: int,
     config: ExtractionConfig,
 ) -> Line:
-    """Grow a line outward from ``(px, py)`` along the local edge tangent."""
+    """Grow a line outward from ``(px, py)`` along the local edge tangent.
+
+    Endpoints are clamped to ``[0, width-1] x [0, height-1]`` — the inner
+    walker can step one or two pixels past the image bound before the
+    while-condition kicks in, and we don't want that leaking into the SVG.
+    """
     seed_angle = math.atan2(grady[py, px], gradx[py, px])
     max_delta = config.max_curve_angle_deg * math.pi / 180.0
     threshold = config.line_continue_thresh * mag[py, px]
@@ -203,11 +208,15 @@ def grow_line(
 
     sx, sy, n_start = grow(+1)
     ex, ey, n_end = grow(-1)
+
+    def clamp(v: float, hi: int) -> int:
+        return max(0, min(int(round(v)), hi - 1))
+
     return Line(
-        x1=int(round(sx)),
-        y1=int(round(sy)),
-        x2=int(round(ex)),
-        y2=int(round(ey)),
+        x1=clamp(sx, width),
+        y1=clamp(sy, height),
+        x2=clamp(ex, width),
+        y2=clamp(ey, height),
         length=n_start + n_end + 1,
     )
 
@@ -281,17 +290,33 @@ def extract_lines(
 # --------------------------------------------------------------------------- #
 
 
-def write_svg(lines: Sequence[Line], path: Path) -> None:
-    """Serialize ``lines`` to an SVG file at ``path``."""
-    dwg = svgwrite.Drawing(str(path), profile="tiny")
+def write_svg(
+    lines: Sequence[Line],
+    path: Path,
+    size: Tuple[int, int],
+) -> None:
+    """Serialize ``lines`` to an SVG file at ``path``.
+
+    ``size`` is ``(width, height)`` in pixels of the source image; it sets
+    both the document's ``viewBox`` and concrete ``width``/``height`` so the
+    file renders correctly in browsers and other SVG viewers (without these,
+    coordinates land outside the default 300x150 viewport and the file looks
+    empty).
+
+    Stroke colour and ``stroke-linecap`` live on a parent ``<g>`` so they
+    aren't repeated on every ``<line>`` — meaningful file-size win on dense
+    images.
+    """
+    width, height = size
+    dwg = svgwrite.Drawing(
+        str(path),
+        size=(f"{width}px", f"{height}px"),
+        viewBox=f"0 0 {width} {height}",
+        profile="tiny",
+    )
+    group = dwg.add(dwg.g(stroke="black", stroke_linecap="round"))
     for line in lines:
-        dwg.add(
-            dwg.line(
-                (line.x1, line.y1),
-                (line.x2, line.y2),
-                stroke=svgwrite.rgb(0, 0, 0, "%"),
-            )
-        )
+        group.add(dwg.line((line.x1, line.y1), (line.x2, line.y2)))
     dwg.save()
 
 
@@ -331,7 +356,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     config = Config()
     image = load_image(args.input)
     lines = img_to_lines(image, config)
-    write_svg(lines, args.output)
+    height, width = image.shape[:2]
+    write_svg(lines, args.output, size=(width, height))
     print(f"img2plot: wrote {len(lines)} line(s) to {args.output}")
     return 0
 
