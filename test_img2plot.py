@@ -25,6 +25,7 @@ from img2plot import (
     _smoothed_neighbour_value,
     auto_scale_config,
     bilinear_interpolate,
+    detect_uniform_background,
     edge_probability,
     extract_lines,
     grow_line,
@@ -245,6 +246,33 @@ def test_preprocess_does_not_mutate_input():
     before = arr.copy()
     _ = preprocess(arr, cfg)
     np.testing.assert_array_equal(arr, before)
+
+
+def test_preprocess_explicit_clip_limit_overrides_auto():
+    """Pinning clahe_clip_limit must override the auto-derivation."""
+    rng = np.random.default_rng(0)
+    img = rng.random((64, 64))
+    out_pinned = preprocess(img, PreprocessConfig(clahe_clip_limit=0.001))
+    out_auto = preprocess(img, PreprocessConfig(clahe_clip_limit=None))
+    # A very low clip should give meaningfully different output than the auto-derived one
+    assert not np.allclose(out_pinned, out_auto)
+
+
+def test_preprocess_auto_clip_is_gentler_for_high_dynamic_range():
+    """High-DR images (already wide brightness range) should get a gentler
+    clip than low-DR images. We measure this indirectly: the auto-clip
+    output should differ less from a low-clip baseline on a high-DR input."""
+    # Wide-DR: spans 0-1
+    high_dr = np.tile(np.linspace(0, 1, 64), (64, 1))
+    # Narrow-DR: spans 0.4-0.6
+    low_dr = np.tile(np.linspace(0.4, 0.6, 64), (64, 1))
+    gentle = PreprocessConfig(clahe_clip_limit=0.005, blur_kernel_size=None)
+    auto = PreprocessConfig(clahe_clip_limit=None, blur_kernel_size=None)
+    # On high-DR input, auto should pick clip ≈ 0.005 (gentle), so output ≈ gentle output
+    diff_high = float(np.abs(preprocess(high_dr, auto) - preprocess(high_dr, gentle)).mean())
+    # On low-DR input, auto picks a much larger clip, so output diverges from gentle
+    diff_low = float(np.abs(preprocess(low_dr, auto) - preprocess(low_dr, gentle)).mean())
+    assert diff_low > diff_high
 
 
 # --------------------------------------------------------------------------- #
@@ -751,6 +779,118 @@ def test_disabling_clahe_actually_changes_output():
     lines_with = img_to_lines(image, cfg_with)
     lines_without = img_to_lines(image, cfg_without)
     assert lines_with != lines_without
+
+
+# --------------------------------------------------------------------------- #
+# detect_uniform_background
+# --------------------------------------------------------------------------- #
+
+
+def test_detect_uniform_background_finds_dark_bg_with_subject():
+    """Classic portrait: dark uniform background with a bright subject."""
+    img = np.zeros((200, 200, 3), dtype=np.uint8)  # black background
+    img[60:140, 60:140] = 200  # bright square subject in the middle
+    mask = detect_uniform_background(img)
+    assert mask is not None
+    # Background should be masked, subject should not
+    assert mask[5, 5] == True  # corner = background
+    assert mask[100, 100] == False  # center = subject
+    # Coverage should be roughly the background area (200x200 - 80x80 = 33600/40000 ~ 84%)
+    coverage = mask.mean()
+    assert 0.7 < coverage < 0.95
+
+
+def test_detect_uniform_background_returns_none_when_corners_disagree():
+    """A gradient image has bright and dark corners; no consistent background."""
+    h, w = 200, 200
+    # Diagonal gradient: top-left dark, bottom-right bright
+    y_idx, x_idx = np.indices((h, w))
+    gray = ((x_idx + y_idx) / (h + w - 2) * 255).astype(np.uint8)
+    img = np.stack([gray, gray, gray], axis=-1)
+    assert detect_uniform_background(img) is None
+
+
+def test_detect_uniform_background_returns_none_when_subject_matches_bg():
+    """If the candidate background covers >95% of the image, masking would
+    erase the subject too — refuse to mask."""
+    img = np.full((100, 100, 3), 50, dtype=np.uint8)  # uniform mid-grey
+    # Only 2 tiny different-coloured pixels in the middle (subject too small)
+    img[50, 50] = 255
+    assert detect_uniform_background(img) is None
+
+
+def test_detect_uniform_background_returns_none_when_bg_too_small():
+    """If the candidate background covers <15%, it's probably not a real
+    background — refuse to mask."""
+    img = np.full((100, 100, 3), 200, dtype=np.uint8)  # mostly bright
+    # Corners are dark but only a few pixels — not a real background
+    img[:3, :3] = 0
+    img[:3, -3:] = 0
+    img[-3:, :3] = 0
+    img[-3:, -3:] = 0
+    # bg "covers" ~36/10000 = 0.36% — way below min_coverage
+    assert detect_uniform_background(img) is None
+
+
+def test_detect_uniform_background_tolerates_one_corner_with_subject_bleed():
+    """Portraits often have subject material reaching one corner. If 3 of 4
+    corners still agree, that's a good-enough background."""
+    img = np.zeros((200, 200, 3), dtype=np.uint8)  # black background
+    img[60:140, 60:140] = 220                      # subject in middle
+    img[180:, :50, :] = 180                        # subject sleeve bleeds into bottom-left
+    mask = detect_uniform_background(img)
+    assert mask is not None, "3-of-4 corner agreement should still detect bg"
+    # The bg pixels (top-left corner) should be in the mask
+    assert mask[5, 100] == True
+
+
+def test_detect_uniform_background_works_on_grayscale_input():
+    img = np.zeros((200, 200), dtype=np.uint8)
+    img[60:140, 60:140] = 200
+    mask = detect_uniform_background(img)
+    assert mask is not None
+    assert mask[5, 5] == True
+    assert mask[100, 100] == False
+
+
+def test_extract_lines_respects_skip_mask():
+    """A skip mask should zero out the magnitude in masked regions before
+    the argmax loop sees it."""
+    img = _vertical_edge_image()
+    # Mask the upper half — no peaks should be found there
+    mask = np.zeros_like(img, dtype=bool)
+    mask[:img.shape[0] // 2, :] = True
+    lines = extract_lines(img, ExtractionConfig(min_line_length=5), skip_mask=mask)
+    # Every line's seed (and most of its body) should be in the lower half
+    for line in lines:
+        assert max(line.y1, line.y2) >= img.shape[0] // 2 - 5, line
+
+
+def test_img_to_lines_concentrates_lines_on_subject_with_auto_mask(tmp_path: Path):
+    """End-to-end: portrait-style synthetic image (uniform background, bright
+    subject in middle). With auto-masking, lines should concentrate on the
+    subject region, not the background."""
+    size, subj_lo, subj_hi = 200, 60, 140
+    img = np.zeros((size, size, 3), dtype=np.uint8)  # black bg
+    img[subj_lo:subj_hi, subj_lo:subj_hi] = 220     # bright subject
+
+    with_mask = img_to_lines(img, Config())
+    without_mask = img_to_lines(img, Config(auto_mask_background=False))
+
+    # With auto-masking, lines should be concentrated near the subject square.
+    # Without it, background-vs-subject edges still dominate but with potential
+    # noise lines in the background regions. The key test: with masking, no
+    # line's midpoint should sit deep in the background.
+    margin = 8
+    for line in with_mask:
+        mx = (line.x1 + line.x2) / 2
+        my = (line.y1 + line.y2) / 2
+        in_subject_x = subj_lo - margin <= mx <= subj_hi + margin
+        in_subject_y = subj_lo - margin <= my <= subj_hi + margin
+        assert in_subject_x or in_subject_y, line
+
+    # Sanity: outputs should differ — masking actually does something
+    assert with_mask != without_mask
 
 
 # --------------------------------------------------------------------------- #

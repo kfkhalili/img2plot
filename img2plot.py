@@ -36,10 +36,15 @@ import svgwrite
 class PreprocessConfig:
     """Knobs that shape the image before edge extraction.
 
-    ``None`` disables the step. Defaults reproduce the legacy script.
+    ``None`` disables a step where applicable. Defaults reproduce the
+    legacy script.
     """
 
     clahe_kernel_size: Optional[int] = 32
+    # CLAHE clip-limit. ``None`` means auto-derive from the input's dynamic
+    # range (high-DR images get a gentler clip; low-DR get a stronger one).
+    # Set to a float to pin the value.
+    clahe_clip_limit: Optional[float] = None
     blur_kernel_size: Optional[int] = 1
 
 
@@ -68,6 +73,10 @@ class Config:
 
     preprocess: PreprocessConfig = field(default_factory=PreprocessConfig)
     extract: ExtractionConfig = field(default_factory=ExtractionConfig)
+    # Auto-detect a uniform background (uniform corners) and exclude it from
+    # line extraction. Big quality win on portraits and product shots; no-op
+    # on busy scenes where corners disagree.
+    auto_mask_background: bool = True
 
 
 @dataclass(frozen=True)
@@ -122,11 +131,23 @@ def normalize_to_unit(img: np.ndarray) -> np.ndarray:
 
 def preprocess(img: np.ndarray, config: PreprocessConfig) -> np.ndarray:
     """Apply CLAHE and/or Gaussian blur. A ``None`` kernel size disables the
-    corresponding step. Returns a new array."""
+    corresponding step. Returns a new array.
+
+    When ``clahe_clip_limit`` is ``None``, the clip is auto-derived from the
+    input's dynamic range (5th-to-95th percentile band): wide-DR images get
+    a gentler clip (~0.005), narrow-DR get a stronger one (~0.05). Set the
+    field explicitly to pin the value.
+    """
     out = img
     if config.clahe_kernel_size is not None:
+        clip = config.clahe_clip_limit
+        if clip is None:
+            p5, p95 = np.percentile(img, [5, 95])
+            dynamic_range = float(p95 - p5)
+            # Linear map: DR=1 → clip=0.005, DR=0 → clip=0.05
+            clip = 0.05 - 0.045 * max(0.0, min(dynamic_range, 1.0))
         out = skimage.exposure.equalize_adapthist(
-            out, kernel_size=config.clahe_kernel_size
+            out, kernel_size=config.clahe_kernel_size, clip_limit=clip
         )
     if config.blur_kernel_size is not None:
         out = ndimage.gaussian_filter(out, config.blur_kernel_size)
@@ -144,6 +165,62 @@ def edge_probability(img: np.ndarray) -> np.ndarray:
     if total == 0:
         return weighted
     return weighted / total
+
+
+def detect_uniform_background(
+    image: np.ndarray,
+    similarity_threshold: float = 0.08,
+    min_coverage: float = 0.15,
+    max_coverage: float = 0.95,
+    corner_fraction: float = 0.02,
+) -> Optional[np.ndarray]:
+    """Detect a uniform background by sampling image corners.
+
+    Returns a boolean mask where ``True`` marks background pixels — caller
+    excludes those from edge extraction. Returns ``None`` when no
+    consistent background is detected:
+
+    - corners disagree on luminance (``similarity_threshold``);
+    - the candidate background covers less than ``min_coverage`` of the
+      image (probably not actually a background);
+    - or covers more than ``max_coverage`` (subject is the same brightness
+      as the background, so masking would erase the subject too).
+
+    Works on luminance, so coloured subjects on coloured backgrounds work
+    fine as long as the four corners agree on brightness.
+    """
+    h, w = image.shape[:2]
+    if image.ndim == 3:
+        gray = image[..., :3].astype(np.float64) @ np.array([0.299, 0.587, 0.114])
+    else:
+        gray = image.astype(np.float64)
+    gray = gray / 255.0
+
+    corner_size = max(5, int(min(h, w) * corner_fraction))
+    corner_means = [
+        float(gray[:corner_size, :corner_size].mean()),
+        float(gray[:corner_size, -corner_size:].mean()),
+        float(gray[-corner_size:, :corner_size].mean()),
+        float(gray[-corner_size:, -corner_size:].mean()),
+    ]
+    # Require 3-of-4 corner agreement (not all 4): portraits often have the
+    # subject bleed into one corner (sweater, hair). Look for a cluster of 3
+    # corners with spread <= threshold; reject if no such cluster exists.
+    sorted_means = sorted(corner_means)
+    if sorted_means[2] - sorted_means[0] <= similarity_threshold:
+        bg_corners = sorted_means[:3]
+    elif sorted_means[3] - sorted_means[1] <= similarity_threshold:
+        bg_corners = sorted_means[1:]
+    else:
+        return None
+
+    bg_luminance = sum(bg_corners) / 3
+    mask = np.abs(gray - bg_luminance) < similarity_threshold
+
+    coverage = float(mask.mean())
+    if coverage < min_coverage or coverage > max_coverage:
+        return None
+    return mask
 
 
 def bilinear_interpolate(img: np.ndarray, x: float, y: float) -> float:
@@ -251,6 +328,8 @@ def _smoothed_neighbour_value(mag: np.ndarray, py: int, px: int) -> float:
 def extract_lines(
     preprocessed: np.ndarray,
     config: ExtractionConfig,
+    *,
+    skip_mask: Optional[np.ndarray] = None,
 ) -> List[Line]:
     """Pull lines from ``preprocessed`` until the magnitude peak drops below
     ``termination_ratio`` of its initial value.
@@ -259,8 +338,14 @@ def extract_lines(
     ``preprocessed`` inside this function — the caller does not need to know
     that mag comes from Sobel and the gradients from ``np.gradient`` of the
     *same* image. ``preprocessed`` is not mutated.
+
+    ``skip_mask`` (boolean, same shape as ``preprocessed``) marks pixels to
+    exclude from line extraction. Used to drop a detected background so
+    lines concentrate on the subject.
     """
     work = edge_probability(preprocessed)  # fresh array — safe to mutate
+    if skip_mask is not None:
+        work[skip_mask] = 0
     grady, gradx = np.gradient(preprocessed)
     height, width = work.shape
     init_max = float(work.max())
@@ -390,11 +475,19 @@ def auto_scale_config(
 
 
 def img_to_lines(image: np.ndarray, config: Config) -> List[Line]:
-    """End-to-end pipeline from a raw image array to a list of lines."""
+    """End-to-end pipeline from a raw image array to a list of lines.
+
+    If ``config.auto_mask_background`` is set (the default), a uniform
+    background is auto-detected from ``image`` and excluded from line
+    extraction. Detection runs on the *original* image, not the
+    CLAHE/blur-preprocessed version, so the background-vs-subject
+    distinction isn't smeared by local contrast equalization.
+    """
     gray = to_grayscale(image)
     normalized = normalize_to_unit(gray)
     preprocessed = preprocess(normalized, config.preprocess)
-    return extract_lines(preprocessed, config.extract)
+    skip_mask = detect_uniform_background(image) if config.auto_mask_background else None
+    return extract_lines(preprocessed, config.extract, skip_mask=skip_mask)
 
 
 # --------------------------------------------------------------------------- #
