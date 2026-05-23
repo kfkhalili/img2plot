@@ -99,3 +99,19 @@ ENV/
 
 # mypy
 .mypy_cache/
+
+# macOS
+.DS_Store
+
+# Local test images and ad-hoc outputs (not part of the project)
+HK.png
+hk-sketch.svg
+
+# Generated comparison artifacts under readme-imgs/. Only the originally
+# published result images (betta.jpg, revali.jpg, dunwall.jpg, img2plot.jpg)
+# are tracked.
+readme-imgs/*-original.jpg
+readme-imgs/*-ours.*
+readme-imgs/*-autoscaled.*
+readme-imgs/*-fully-auto*
+
