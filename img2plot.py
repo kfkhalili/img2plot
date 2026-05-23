@@ -1,303 +1,340 @@
-import matplotlib.pyplot as plt
-from scipy import ndimage
-import scipy.misc
-import numpy as np
+#!/usr/bin/env python3
+"""img2plot - turn images into pen-plotter line drawings.
+
+The pipeline is a sequence of pure transformations:
+
+    image -> grayscale -> normalize -> preprocess -> extract lines -> SVG
+
+Each transformation takes its input by value and returns a new array. The
+line-extraction module owns the edge-probability and gradient derivation
+internally, so its callers only have to hand over a preprocessed image.
+"""
+
+from __future__ import annotations
+
+import argparse
 import math
-import skimage.exposure
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import List, Optional, Sequence, Tuple
+
+import imageio.v3 as iio
+import numpy as np
+import scipy.ndimage as ndimage
 import skimage.draw
+import skimage.exposure
 import svgwrite
 
-# ---------------------------------------------------------------------------------------------------------------------
-# Input and Output
 
-INPUT_IMAGE_PATH = "path/to/input/file.png"
+# --------------------------------------------------------------------------- #
+# Configuration / value types
+# --------------------------------------------------------------------------- #
 
-OUTPUT_SVG_PATH = "path/to/results/file.svg"
 
-# ---------------------------------------------------------------------------------------------------------------------
-# Configuration parameters.  These affect the appearance of the output image.
+@dataclass(frozen=True)
+class PreprocessConfig:
+    """Knobs that shape the image before edge extraction.
+
+    ``None`` disables the step. Defaults reproduce the legacy script.
+    """
 
-# Program will continue drawing lines on the highest-intensity edges until the max intensity value drops below
-# this fraction of the initial peak value. A smaller number means more lines will be drawn.
-TERMINATION_RATIO = 1.0/3.5
+    clahe_kernel_size: Optional[int] = 32
+    blur_kernel_size: Optional[int] = 1
 
-# A line is extended until the edge intensity drops below this fraction of the corresponding peak edge intensity.
-# Larger values mean many small lines; smaller values cause lines to extend for longer distances.
-LINE_CONTINUE_THRESH = 0.01
 
-# Lines must be longer than this length in pixels, else they will not be drawn.
-# Smaller numbers can mean lots of short lines, but will represent small details more faithfully.
-# Larger numbers can result in an aesthetically-pleasing "sketchy" look - losing small details.
-MIN_LINE_LENGTH = 21
+@dataclass(frozen=True)
+class ExtractionConfig:
+    """Knobs that shape how lines are pulled from the preprocessed image."""
 
-# Sets the amount of angle change before a line will be terminated.
-# Small numbers mean many short lines; large numbers mean longer lines, but they cut corners.
-MAX_CURVE_ANGLE_DEG = 20.0
+    termination_ratio: float = 1.0 / 3.5
+    line_continue_thresh: float = 0.01
+    min_line_length: int = 21
+    max_curve_angle_deg: float = 20.0
+    lpf_atk: float = 0.05
 
-# When drawing / extending lines, each new pixel contributes to the line direction, via a low-pass filter with this
-# attack value.  Higher numbers mean lines can turn faster.
-LPF_ATK = 0.05
 
-# Apply CLAHE (Contrast Limited Adaptive Histogram Equalization) to the monochrome image as a preprocessing step.
-# This can help bring out more details, especially if the input image has large areas of bright and dark.
-USE_CLAHE = True
-CLAHE_KERNEL_SIZE = 32
+@dataclass(frozen=True)
+class Config:
+    """Bundle of preprocessing + extraction knobs for the full pipeline."""
 
-# Apply a Gaussian blur as a preprocessing step.
-# This can help generate longer lines if the input image is noisy or otherwise high-frequency.
-USE_GAUSSIAN_BLUR = True
-GAUSSIAN_KERNEL_SIZE = 1
+    preprocess: PreprocessConfig = field(default_factory=PreprocessConfig)
+    extract: ExtractionConfig = field(default_factory=ExtractionConfig)
+
 
-# ---------------------------------------------------------------------------------------------------------------------
-# Utility functions
+@dataclass(frozen=True)
+class Line:
+    """An immutable line segment with its grown length in pixels."""
 
-def rgb2gray(rgb):
-    return np.dot(rgb[...,:3], [0.299, 0.587, 0.114])
+    x1: int
+    y1: int
+    x2: int
+    y2: int
+    length: int
 
-def bilinearInterpolate(img, (x,y)):
-    xfloat = x - math.floor(x)
-    yfloat = y - math.floor(y)
 
-    xfloor = math.floor(x)
-    yfloor = math.floor(y)
-
-    xceil = math.ceil(x)
-    yceil = math.ceil(y)
-
-    if(xfloor < 0):
-        xfloor = 0
-    if(xceil >= img.shape[1]):
-        xceil = img.shape[1]-1
-
-    if (yfloor < 0):
-        yfloor = 0
-    if (yceil >= img.shape[0]):
-        yceil = img.shape[0] - 1
-
-    topLeft = img[int(yfloor), int(xfloor)]
-    topRight = img[int(yfloor), int(xceil)]
-    bottomLeft = img[int(yceil), int(xfloor)]
-    bottomRight = img[int(yceil), int(xceil)]
-
-    topMid = xfloat * topRight + (1-xfloat) * topLeft
-    botMid = xfloat * bottomRight + (1-xfloat) * bottomLeft
-
-    mid = yfloat * botMid + (1-yfloat) * topMid
-
-    return mid
-
-def getLineFromGradient(img, (px, py), (gradx, grady)):
-    angle = math.atan2(grady[py,px], gradx[py,px])
-
-    # Attempt to grow the line as much as possible.
-    # The line can continue forever at the given angle, until:
-    #   - the Sobel value changes too much
-    #   - the gradient direction changes too much (more than 5 degrees)
-
-    len_left = 0
-    len_right = 0
-
-    startx = px
-    starty = py
-    endx = px
-    endy = py
-
-    mangle = angle
-
-    # grow the "start" side (calling it "left" because reasons)
-    while 0 < starty < img.shape[0]-1 and 0 < startx < img.shape[1] - 1 \
-            and bilinearInterpolate(img, (startx, starty)) > LINE_CONTINUE_THRESH * img[py, px]:
-
-        len_left += 1
-
-        # Recalculate angle.  This allows lines to "follow" curves, at least a little.
-        cangle = math.atan2(grady[int(round(starty)), int(round(startx))],
-                            gradx[int(round(starty)), int(round(startx))])
-
-        # low pass filtered angle update
-        mangle = mangle * (1-LPF_ATK) + cangle * LPF_ATK
-
-        if abs(angle - mangle) > MAX_CURVE_ANGLE_DEG * (2 * math.pi / 360):
-            break
-
-        startx = pIdxCol + len_left * math.sin(mangle)
-        starty = pIdxRow - len_left * math.cos(mangle)
-
-    mangle = angle
-
-    # grow the "end" side (calling it "right" because reasons)
-    while 0 < endy < img.shape[0]-1 and 0 < endx < img.shape[1] - 1 \
-            and bilinearInterpolate(img, (endx, endy)) > LINE_CONTINUE_THRESH * img[py, px]:
-
-        len_right += 1
-
-        # Recalculate angle.  This allows lines to "follow" curves, at least a little.
-        cangle = math.atan2(grady[int(round(endy)), int(round(endx))],
-                            gradx[int(round(endy)), int(round(endx))])
-
-        # low pass filtered angle update
-        mangle = mangle * (1 - LPF_ATK) + cangle * LPF_ATK
-
-        if abs(angle - mangle) > MAX_CURVE_ANGLE_DEG * (2 * math.pi / 360):
-            break
-
-        endx = pIdxCol - len_right * math.sin(mangle)
-        endy = pIdxRow + len_right * math.cos(mangle)
-
-    return int(round(startx)), int(round(starty)), int(round(endx)), int(round(endy)), (len_left + len_right + 1)
-
-dwg = svgwrite.Drawing(OUTPUT_SVG_PATH, profile='tiny')
-
-baseImage = scipy.misc.imread(INPUT_IMAGE_PATH)
-baseImageGray = rgb2gray(baseImage)
-
-# normalize 0..1
-normImgGray = baseImageGray - baseImageGray.min()
-normImgGray = normImgGray / normImgGray.max()
-
-# CLAHE (brings out details)
-if USE_CLAHE:
-    normImgGray = skimage.exposure.equalize_adapthist(normImgGray, kernel_size=CLAHE_KERNEL_SIZE)
-
-# Gaussian blur (gets rid of details)
-if USE_GAUSSIAN_BLUR:
-    normImgGray = scipy.ndimage.filters.gaussian_filter(normImgGray, GAUSSIAN_KERNEL_SIZE)
-
-plt.imshow(normImgGray, cmap='gray')
-plt.show()
-
-sobelDx = ndimage.sobel(normImgGray, 0)  # horizontal
-sobelDy = ndimage.sobel(normImgGray, 1)  # vertical
-mag = np.hypot(sobelDx, sobelDy)
-
-# where the image is locally darker in low frequencies, increase the probability of drawing a line.
-imgBlur = scipy.ndimage.filters.gaussian_filter(normImgGray, 2)
-mag = np.multiply(mag, imgBlur.max()-imgBlur)
-
-# turn mag into a proper probability distribution function
-mag = mag / np.sum(mag)
-
-plt.imshow(mag)
-plt.colorbar()
-plt.show()
-
-magGradY, magGradX = np.gradient(normImgGray)
-
-plt.imshow(magGradX)
-plt.show()
-
-plt.imshow(magGradY)
-plt.show()
-
-lineImg = np.zeros(mag.shape)
-lineImg = lineImg - 1
-
-anglehist = []
-linehist = []
-# Sample a lot of edges
-
-outImg = np.zeros(mag.shape, dtype=np.uint8)
-
-initmaxp = mag.max()
-cmax = initmaxp
-i = 0
-
-llacc = 0.0
-llcnt = 0.0
-minll = 1e9
-maxll = 0
-
-while cmax > initmaxp*TERMINATION_RATIO:
-    i = i+1
-    if i % 250 == 0:
-        print "Max P: ", mag.max(), " term at:", initmaxp*TERMINATION_RATIO
-        print "Line Stats: N=", llcnt, "length: min", minll, "mean", llacc/llcnt, "max", maxll
-        llacc = 0
-        llcnt = 0
-        minll = 99999
-        maxll = 0
-
-    pixIdx = mag.argmax()
-
-    pIdxRow = int(pixIdx / mag.shape[1])
-    pIdxCol = pixIdx % mag.shape[1]
-
-    cmax = mag[pIdxRow, pIdxCol]
-    # print pIdxRow, ",", pIdxCol
-
-    (lstartx, lstarty, lendx, lendy, totalLength) = getLineFromGradient(mag, (pIdxCol, pIdxRow), (magGradX, magGradY))
-
-    if totalLength < MIN_LINE_LENGTH:
-        # this is too short, and is not worth drawing
-        # We don't want to shorten other lines, so replace this peak with the (guaranteed smaller) mean of its neighbors
-        acc = 0.0
-        cnt = 0
-        if pIdxRow+1 < mag.shape[0]:
-            acc = acc + mag[pIdxRow+1, pIdxCol]
-            cnt = cnt+1
-
-        if pIdxCol + 1 < mag.shape[1]:
-            acc = acc + mag[pIdxRow, pIdxCol+1]
-            cnt = cnt + 1
-
-        if pIdxRow - 1 >= 0:
-            acc = acc + mag[pIdxRow - 1, pIdxCol]
-            cnt = cnt + 1
-
-        if pIdxCol - 1 >= 0:
-            acc = acc + mag[pIdxRow, pIdxCol - 1]
-            cnt = cnt + 1
-
-        mag[pIdxRow, pIdxCol] = acc / cnt
-
-        continue
-
-    # draw this line in the SVG image, too
-    dwg.add(dwg.line((lstartx, lstarty), (lendx, lendy), stroke=svgwrite.rgb(0,0,0,'%')))
-
-    # collect line statistics:
-
-    # accumulator for mean & line count
-    llacc = llacc + totalLength
-    llcnt = llcnt + 1
-
-    # min/max line lengths
-    if totalLength < minll:
-        minll = totalLength
-
-    if totalLength > maxll:
-        maxll = totalLength
-
-    # draw the line on the edge image and preview images.
-
-    rr, cc, val = skimage.draw.line_aa(lstarty, lstartx, lendy, lendx)
-    rrd, ccd = skimage.draw.line(lstarty, lstartx, lendy, lendx)
-
-    rr[rr < 0] = 0
-    rr[rr >= mag.shape[0]] = mag.shape[0]-1
-
-    cc[cc < 0] = 0
-    cc[cc >= mag.shape[1]] = mag.shape[1] - 1
-
-    rrd[rrd < 0] = 0
-    rrd[rrd >= mag.shape[0]] = mag.shape[0] - 1
-
-    ccd[ccd < 0] = 0
-    ccd[ccd >= mag.shape[1]] = mag.shape[1] - 1
-
-    # Draw the line in the preview image, for visualization purposes
-    outImg[rrd, ccd] = 255
-
-    # Draw the line in the edge magnitude image
-    mag[rr, cc] = 0
-    mag[pIdxRow, pIdxCol] = 0  # also knock down the peak intensity that created this line, because the lines can move
-
-outImg[outImg > 255] = 255
-
-outImg = -1*outImg + 255
-
-dwg.save()
-
-plt.imshow(outImg, cmap='gray')
-plt.show()
-
+# --------------------------------------------------------------------------- #
+# Pure transformations
+# --------------------------------------------------------------------------- #
+
+
+def load_image(path: Path) -> np.ndarray:
+    """Read an image from ``path`` and return it as a numpy array."""
+    return np.asarray(iio.imread(str(path)))
+
+
+def to_grayscale(img: np.ndarray) -> np.ndarray:
+    """Convert an RGB(A) or already-grayscale image to a float gray array.
+
+    Uses the ITU-R BT.601 luma weights (0.299, 0.587, 0.114). Alpha is
+    discarded. ``(H, W, 1)`` (single-channel) and ``(H, W, 2)`` (gray + alpha)
+    are treated as already-grayscale.
+    """
+    if img.ndim == 2:
+        return img.astype(np.float64)
+    if img.ndim != 3:
+        raise ValueError(f"unsupported image shape {img.shape!r}")
+    channels = img.shape[-1]
+    if channels >= 3:
+        return img[..., :3].astype(np.float64) @ np.array([0.299, 0.587, 0.114])
+    if channels >= 1:
+        return img[..., 0].astype(np.float64)
+    raise ValueError(f"unsupported channel count {channels}")
+
+
+def normalize_to_unit(img: np.ndarray) -> np.ndarray:
+    """Linearly scale ``img`` so that [min, max] maps to [0, 1]."""
+    arr = np.asarray(img, dtype=np.float64)
+    lo = arr.min()
+    hi = arr.max()
+    if hi == lo:
+        return np.zeros_like(arr)
+    return (arr - lo) / (hi - lo)
+
+
+def preprocess(img: np.ndarray, config: PreprocessConfig) -> np.ndarray:
+    """Apply CLAHE and/or Gaussian blur. A ``None`` kernel size disables the
+    corresponding step. Returns a new array."""
+    out = img
+    if config.clahe_kernel_size is not None:
+        out = skimage.exposure.equalize_adapthist(
+            out, kernel_size=config.clahe_kernel_size
+        )
+    if config.blur_kernel_size is not None:
+        out = ndimage.gaussian_filter(out, config.blur_kernel_size)
+    return out
+
+
+def edge_probability(img: np.ndarray) -> np.ndarray:
+    """Sobel edge magnitude weighted toward darker regions, as a PDF."""
+    dx = ndimage.sobel(img, axis=0)
+    dy = ndimage.sobel(img, axis=1)
+    mag = np.hypot(dx, dy)
+    blur = ndimage.gaussian_filter(img, 2)
+    weighted = mag * (blur.max() - blur)
+    total = weighted.sum()
+    if total == 0:
+        return weighted
+    return weighted / total
+
+
+def bilinear_interpolate(img: np.ndarray, x: float, y: float) -> float:
+    """Bilinear sample of ``img`` at fractional ``(x, y)``.
+
+    Coordinates outside the image are clamped to the nearest valid pixel.
+    """
+    h, w = img.shape[:2]
+    x_floor = max(0, min(int(math.floor(x)), w - 1))
+    y_floor = max(0, min(int(math.floor(y)), h - 1))
+    x_ceil = max(0, min(int(math.ceil(x)), w - 1))
+    y_ceil = max(0, min(int(math.ceil(y)), h - 1))
+
+    x_frac = x - math.floor(x)
+    y_frac = y - math.floor(y)
+
+    top_left = img[y_floor, x_floor]
+    top_right = img[y_floor, x_ceil]
+    bot_left = img[y_ceil, x_floor]
+    bot_right = img[y_ceil, x_ceil]
+
+    top = x_frac * top_right + (1 - x_frac) * top_left
+    bot = x_frac * bot_right + (1 - x_frac) * bot_left
+    return float(y_frac * bot + (1 - y_frac) * top)
+
+
+# --------------------------------------------------------------------------- #
+# Line extraction
+# --------------------------------------------------------------------------- #
+
+
+def grow_line(
+    mag: np.ndarray,
+    gradx: np.ndarray,
+    grady: np.ndarray,
+    px: int,
+    py: int,
+    config: ExtractionConfig,
+) -> Line:
+    """Grow a line outward from ``(px, py)`` along the local edge tangent."""
+    seed_angle = math.atan2(grady[py, px], gradx[py, px])
+    max_delta = config.max_curve_angle_deg * math.pi / 180.0
+    threshold = config.line_continue_thresh * mag[py, px]
+    height, width = mag.shape
+
+    def grow(side_sign: int) -> Tuple[float, float, int]:
+        """Walk outward; ``+1`` extends the "start" side, ``-1`` the "end" side."""
+        x, y = float(px), float(py)
+        mangle = seed_angle
+        steps = 0
+        while (
+            0 < y < height - 1
+            and 0 < x < width - 1
+            and bilinear_interpolate(mag, x, y) > threshold
+        ):
+            steps += 1
+            ix, iy = int(round(x)), int(round(y))
+            cangle = math.atan2(grady[iy, ix], gradx[iy, ix])
+            mangle = mangle * (1 - config.lpf_atk) + cangle * config.lpf_atk
+            if abs(seed_angle - mangle) > max_delta:
+                break
+            x = px + side_sign * steps * math.sin(mangle)
+            y = py - side_sign * steps * math.cos(mangle)
+        return x, y, steps
+
+    sx, sy, n_start = grow(+1)
+    ex, ey, n_end = grow(-1)
+    return Line(
+        x1=int(round(sx)),
+        y1=int(round(sy)),
+        x2=int(round(ex)),
+        y2=int(round(ey)),
+        length=n_start + n_end + 1,
+    )
+
+
+def _smoothed_neighbour_value(mag: np.ndarray, py: int, px: int) -> float:
+    """Mean of the 4-connected neighbours of ``(py, px)`` inside ``mag``."""
+    h, w = mag.shape
+    neighbours: List[float] = []
+    if py + 1 < h:
+        neighbours.append(float(mag[py + 1, px]))
+    if px + 1 < w:
+        neighbours.append(float(mag[py, px + 1]))
+    if py - 1 >= 0:
+        neighbours.append(float(mag[py - 1, px]))
+    if px - 1 >= 0:
+        neighbours.append(float(mag[py, px - 1]))
+    if not neighbours:
+        # 1x1 image: no neighbours to average. Drop the peak so the calling
+        # loop's argmax stops returning this cell and termination triggers.
+        return 0.0
+    return sum(neighbours) / len(neighbours)
+
+
+def extract_lines(
+    preprocessed: np.ndarray,
+    config: ExtractionConfig,
+) -> List[Line]:
+    """Pull lines from ``preprocessed`` until the magnitude peak drops below
+    ``termination_ratio`` of its initial value.
+
+    The edge-probability map and the directional gradients are derived from
+    ``preprocessed`` inside this function — the caller does not need to know
+    that mag comes from Sobel and the gradients from ``np.gradient`` of the
+    *same* image. ``preprocessed`` is not mutated.
+    """
+    work = edge_probability(preprocessed)  # fresh array — safe to mutate
+    grady, gradx = np.gradient(preprocessed)
+    height, width = work.shape
+    init_max = float(work.max())
+    if init_max <= 0:
+        return []
+    termination = init_max * config.termination_ratio
+
+    lines: List[Line] = []
+    while float(work.max()) > termination:
+        flat_idx = int(work.argmax())
+        py, px = divmod(flat_idx, width)
+
+        line = grow_line(work, gradx, grady, px, py, config)
+
+        if line.length < config.min_line_length:
+            # Replace this peak with the (smaller) mean of its 4-neighbours so
+            # it stops winning argmax, but the surrounding field is preserved.
+            work[py, px] = _smoothed_neighbour_value(work, py, px)
+            continue
+
+        lines.append(line)
+
+        # Zero out the magnitude along the drawn line so the same edge isn't
+        # picked again, then knock down the seed pixel itself.
+        rr, cc, _ = skimage.draw.line_aa(line.y1, line.x1, line.y2, line.x2)
+        rr = np.clip(rr, 0, height - 1)
+        cc = np.clip(cc, 0, width - 1)
+        work[rr, cc] = 0
+        work[py, px] = 0
+    return lines
+
+
+# --------------------------------------------------------------------------- #
+# IO
+# --------------------------------------------------------------------------- #
+
+
+def write_svg(lines: Sequence[Line], path: Path) -> None:
+    """Serialize ``lines`` to an SVG file at ``path``."""
+    dwg = svgwrite.Drawing(str(path), profile="tiny")
+    for line in lines:
+        dwg.add(
+            dwg.line(
+                (line.x1, line.y1),
+                (line.x2, line.y2),
+                stroke=svgwrite.rgb(0, 0, 0, "%"),
+            )
+        )
+    dwg.save()
+
+
+def img_to_lines(image: np.ndarray, config: Config) -> List[Line]:
+    """End-to-end pipeline from a raw image array to a list of lines."""
+    gray = to_grayscale(image)
+    normalized = normalize_to_unit(gray)
+    preprocessed = preprocess(normalized, config.preprocess)
+    return extract_lines(preprocessed, config.extract)
+
+
+# --------------------------------------------------------------------------- #
+# CLI
+# --------------------------------------------------------------------------- #
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="img2plot",
+        description="Convert an image to an SVG of pen-plotter line strokes.",
+    )
+    parser.add_argument(
+        "--input", "-i",
+        required=True, type=Path,
+        help="Path to the input image (PNG, JPG, ...).",
+    )
+    parser.add_argument(
+        "--output", "-o",
+        required=True, type=Path,
+        help="Path to the output SVG file.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(argv)
+    config = Config()
+    image = load_image(args.input)
+    lines = img_to_lines(image, config)
+    write_svg(lines, args.output)
+    print(f"img2plot: wrote {len(lines)} line(s) to {args.output}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
