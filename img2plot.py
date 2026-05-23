@@ -15,7 +15,7 @@ from __future__ import annotations
 import argparse
 import math
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
@@ -52,6 +52,14 @@ class ExtractionConfig:
     min_line_length: int = 21
     max_curve_angle_deg: float = 20.0
     lpf_atk: float = 0.05
+    # Defensive cap on the argmax/grow/reject loop. When ``min_line_length`` is
+    # high relative to what the magnitude field actually supports, most
+    # candidates are rejected; each rejection only lowers a single peak, so
+    # neighbouring peaks in the same cluster keep getting picked and rejected.
+    # The loop terminates eventually (the field does drain) but can take
+    # tens of minutes on large images. The cap bounds wall time at the cost
+    # of potentially-incomplete output, which the caller is warned about.
+    max_iterations: int = 200_000
 
 
 @dataclass(frozen=True)
@@ -261,7 +269,18 @@ def extract_lines(
     termination = init_max * config.termination_ratio
 
     lines: List[Line] = []
+    iterations = 0
     while float(work.max()) > termination:
+        if iterations >= config.max_iterations:
+            print(
+                f"img2plot: hit max_iterations={config.max_iterations} after "
+                f"{len(lines)} lines; returning partial result. Consider "
+                f"raising termination_ratio or lowering min_line_length.",
+                file=sys.stderr,
+            )
+            break
+        iterations += 1
+
         flat_idx = int(work.argmax())
         py, px = divmod(flat_idx, width)
 
@@ -320,6 +339,56 @@ def write_svg(
     dwg.save()
 
 
+def auto_scale_config(
+    image: np.ndarray,
+    base: Optional[Config] = None,
+    reference_dim: int = 700,
+    scale_min: float = 0.5,
+    scale_max: float = 8.0,
+) -> Config:
+    """Return a Config with preprocessing kernels rescaled to image size.
+
+    The legacy preprocessing defaults (``clahe_kernel_size=32``,
+    ``blur_kernel_size=1``) were tuned by the upstream author for ~700px
+    images. On larger inputs the CLAHE kernel covers proportionally less of
+    the frame and the Gaussian blur becomes near-useless, leaving fine
+    textures un-smoothed and the magnitude field full of scribble-inducing
+    peaks. Scaling those two fields by ``min(width, height) / reference_dim``
+    restores the intended relative behavior on any input size.
+
+    ``min_line_length`` is *deliberately not scaled*. Raising it triggers
+    the algorithm's rejection branch, where each rejected peak is lowered
+    by averaging its 4 neighbours. The argmax loop is O(width * height) per
+    iteration, so on large images a high rejection rate produces wall times
+    measured in tens of minutes. Smarter pixel-length scaling can be added
+    later (and gated by an iteration cap), but for now this is left to
+    user tuning.
+
+    Dimensionless fields (``termination_ratio``, ``line_continue_thresh``,
+    angles, the LPF attack, ``max_iterations``) are never scaled. ``None``
+    kernel sizes are passed through unchanged. ``scale_min`` / ``scale_max``
+    clamp pathological inputs (32px thumbnail, 16k panorama).
+    """
+    if base is None:
+        base = Config()
+    h, w = image.shape[:2]
+    raw = min(w, h) / reference_dim
+    scale = max(scale_min, min(raw, scale_max))
+
+    def scale_int(value: Optional[int]) -> Optional[int]:
+        if value is None:
+            return None
+        return max(1, int(round(value * scale)))
+
+    return Config(
+        preprocess=PreprocessConfig(
+            clahe_kernel_size=scale_int(base.preprocess.clahe_kernel_size),
+            blur_kernel_size=scale_int(base.preprocess.blur_kernel_size),
+        ),
+        extract=base.extract,
+    )
+
+
 def img_to_lines(image: np.ndarray, config: Config) -> List[Line]:
     """End-to-end pipeline from a raw image array to a list of lines."""
     gray = to_grayscale(image)
@@ -353,8 +422,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
-    config = Config()
     image = load_image(args.input)
+    config = auto_scale_config(image)
     lines = img_to_lines(image, config)
     height, width = image.shape[:2]
     write_svg(lines, args.output, size=(width, height))

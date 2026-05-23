@@ -23,6 +23,7 @@ from img2plot import (
     Line,
     PreprocessConfig,
     _smoothed_neighbour_value,
+    auto_scale_config,
     bilinear_interpolate,
     edge_probability,
     extract_lines,
@@ -481,6 +482,18 @@ def test_extract_lines_exercises_the_short_line_rejection_branch():
     assert lines == []
 
 
+def test_extract_lines_respects_max_iterations(capsys):
+    """When max_iterations is hit, extract_lines must return what it has and
+    warn on stderr — protects against rejection-loop runtime traps on large
+    images with aggressive min_line_length."""
+    img = _vertical_edge_image()
+    cfg = ExtractionConfig(min_line_length=10_000, max_iterations=50)
+    lines = extract_lines(img, cfg)
+    assert lines == []  # nothing drawn (every candidate too short)
+    captured = capsys.readouterr()
+    assert "max_iterations=50" in captured.err
+
+
 # --------------------------------------------------------------------------- #
 # _smoothed_neighbour_value (private but load-bearing in the rejection branch)
 # --------------------------------------------------------------------------- #
@@ -738,6 +751,107 @@ def test_disabling_clahe_actually_changes_output():
     lines_with = img_to_lines(image, cfg_with)
     lines_without = img_to_lines(image, cfg_without)
     assert lines_with != lines_without
+
+
+# --------------------------------------------------------------------------- #
+# auto_scale_config — pixel-dimensioned parameters scale with image size
+# --------------------------------------------------------------------------- #
+
+
+def _blank_image(width: int, height: int) -> np.ndarray:
+    return np.zeros((height, width, 3), dtype=np.uint8)
+
+
+def test_auto_scale_config_at_reference_size_is_identity():
+    """700px image -> scale ~1.0 -> kernel sizes unchanged."""
+    cfg = auto_scale_config(_blank_image(700, 700))
+    assert cfg.preprocess.clahe_kernel_size == 32
+    assert cfg.preprocess.blur_kernel_size == 1
+
+
+def test_auto_scale_config_doubles_kernels_at_double_size():
+    """1400px image -> scale 2.0 -> kernel sizes double."""
+    cfg = auto_scale_config(_blank_image(1400, 1400))
+    assert cfg.preprocess.clahe_kernel_size == 64
+    assert cfg.preprocess.blur_kernel_size == 2
+
+
+def test_auto_scale_config_does_not_scale_min_line_length():
+    """min_line_length triggers the O(W*H) rejection loop on big images.
+    Auto-scaling it makes large inputs wall-clock-pathological. Pixel-length
+    scaling is left to the user."""
+    cfg_small = auto_scale_config(_blank_image(350, 350))
+    cfg_big = auto_scale_config(_blank_image(2800, 2800))
+    assert cfg_small.extract.min_line_length == 21
+    assert cfg_big.extract.min_line_length == 21
+
+
+def test_auto_scale_config_uses_smaller_dimension():
+    """Wide panorama: scale is set by the *smaller* dimension (height)."""
+    cfg_panorama = auto_scale_config(_blank_image(3000, 700))
+    cfg_square = auto_scale_config(_blank_image(700, 700))
+    assert cfg_panorama.preprocess.clahe_kernel_size == cfg_square.preprocess.clahe_kernel_size
+
+
+def test_auto_scale_config_preserves_none_for_disabled_steps():
+    """If the user disabled a preprocessing step, scaling keeps it disabled."""
+    base = Config(preprocess=PreprocessConfig(clahe_kernel_size=None,
+                                              blur_kernel_size=None))
+    cfg = auto_scale_config(_blank_image(1400, 1400), base=base)
+    assert cfg.preprocess.clahe_kernel_size is None
+    assert cfg.preprocess.blur_kernel_size is None
+
+
+def test_auto_scale_config_does_not_scale_dimensionless_fields():
+    """Termination ratio, angles, the LPF attack — none of these have units of
+    pixels, so they must not scale."""
+    cfg = auto_scale_config(_blank_image(2800, 2800))  # 4x scale
+    assert cfg.extract.termination_ratio == pytest.approx(1.0 / 3.5)
+    assert cfg.extract.line_continue_thresh == pytest.approx(0.01)
+    assert cfg.extract.max_curve_angle_deg == pytest.approx(20.0)
+    assert cfg.extract.lpf_atk == pytest.approx(0.05)
+
+
+def test_auto_scale_config_clamps_extreme_image_sizes():
+    """A 32px thumbnail or a 16k panorama shouldn't blow up the kernels."""
+    tiny = auto_scale_config(_blank_image(32, 32))  # raw scale 0.046
+    huge = auto_scale_config(_blank_image(16000, 16000))  # raw scale ~23
+    # scale_min=0.5 -> 32*0.5=16 min, 1*0.5 rounds to 1 (clamped to >=1)
+    assert tiny.preprocess.clahe_kernel_size == 16
+    assert tiny.preprocess.blur_kernel_size == 1
+    # scale_max=8 -> 32*8=256, 1*8=8
+    assert huge.preprocess.clahe_kernel_size == 256
+    assert huge.preprocess.blur_kernel_size == 8
+
+
+def test_auto_scale_config_inherits_user_overrides_before_scaling():
+    """User sets clahe_kernel_size=20 on a 700px reference; at 1400px scaling
+    doubles it to 40 (rather than scaling the default 32 to 64)."""
+    base = Config(preprocess=PreprocessConfig(clahe_kernel_size=20))
+    cfg = auto_scale_config(_blank_image(1400, 1400), base=base)
+    assert cfg.preprocess.clahe_kernel_size == 40
+
+
+def test_main_auto_scales_for_large_images(tmp_path: Path):
+    """The CLI should auto-scale by default. A larger-than-reference image
+    should produce different output than the unscaled algorithm would on
+    the same input."""
+    png = tmp_path / "big_square.png"
+    svg = tmp_path / "out.svg"
+    # 1400x1400 = scale factor 2.0
+    img = np.full((1400, 1400, 3), 255, dtype=np.uint8)
+    img[400:1000, 400:1000] = 0  # large dark square
+    iio.imwrite(png, img)
+
+    main(["-i", str(png), "-o", str(svg)])
+    auto_lines = ET.parse(svg).findall(".//svg:line", SVG_NS)
+
+    image = np.asarray(iio.imread(png))
+    unscaled_lines = img_to_lines(image, Config())
+
+    # The scaled-config output should differ in line count (or coordinates)
+    # from the unscaled output. Otherwise auto-scaling is a no-op.
+    assert len(auto_lines) != len(unscaled_lines)
 
 
 def test_cli_runs_as_a_subprocess(tmp_path: Path):
